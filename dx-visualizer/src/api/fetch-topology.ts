@@ -17,6 +17,7 @@ import { fetchVpcs, fetchVpnGateways, fetchTransitGateways, fetchTransitGatewayA
 import { assumeRoleInAccount } from './organizations';
 import { fetchBgpPrefixMetrics } from './cloudwatch-dx';
 import { fetchDxMaintenanceEvents } from './health-dx';
+import { config } from '../utils/config';
 
 /**
  * Run one resource fetch, recording failure instead of aborting the load.
@@ -52,8 +53,18 @@ function noteIssue(issues: FetchIssue[], label: string, kind: FetchIssueKind, me
   issues.push({ label, kind, message });
 }
 
-export async function fetchAllTopologyData(creds: AwsCredentials): Promise<TopologyData> {
+export async function fetchAllTopologyData(inputCreds: AwsCredentials): Promise<TopologyData> {
   const fetchIssues: FetchIssue[] = [];
+
+  // When an allow-list is configured (VITE_ALLOWED_REGIONS), the home region
+  // must itself be an allowed region — the home region is fetched
+  // unconditionally in Phase 2, so a home region outside the SCP-allowed set
+  // (e.g. the hardcoded us-east-1 default) would produce AccessDenied errors.
+  // Pin it to the first allowed region unless it already is one.
+  const creds: AwsCredentials =
+    config.allowedRegions.length > 0 && !config.allowedRegions.includes(inputCreds.region)
+      ? { ...inputCreds, region: config.allowedRegions[0] }
+      : inputCreds;
 
   // --- Phase 1: Fetch global services (DX Gateways, Cloud WAN, Locations) ---
   // These APIs are global and work from any region.
@@ -162,6 +173,25 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
   // Remove default region — already fetched
   discoveredRegions.delete(creds.region);
 
+  // Constrain discovery to the operator's configured regions.
+  if (config.allowedRegions.length > 0) {
+    // Allow-list wins: probe ONLY these regions. Everything else (including
+    // regions surfaced by DescribeRegions or DX/Cloud WAN breadcrumbs) is
+    // dropped, so an org SCP that permits only a known set of regions never
+    // triggers an AccessDenied. The home region is already fetched, so it is
+    // excluded here to avoid a duplicate fetch.
+    const allowed = new Set(config.allowedRegions);
+    for (const r of [...discoveredRegions]) {
+      if (!allowed.has(r) || r === creds.region) discoveredRegions.delete(r);
+    }
+  } else {
+    // Otherwise, drop any regions the operator excluded via
+    // VITE_EXCLUDED_REGIONS. These are never probed, so a region walled off by
+    // an org SCP (where the account has no resources anyway) produces no
+    // AccessDenied fetch issues.
+    for (const r of config.excludedRegions) discoveredRegions.delete(r);
+  }
+
   console.log(`[AWS] Discovered regions: ${creds.region} (pre-fetched)${discoveredRegions.size > 0 ? `, ${[...discoveredRegions].join(', ')}` : ''}`);
 
   // Fetch friendly names only for the regions we actually touch, in parallel
@@ -187,7 +217,15 @@ export async function fetchAllTopologyData(creds: AwsCredentials): Promise<Topol
   const missingRegions = new Set<string>();
   for (const regions of attachmentRegionSets) {
     for (const r of regions) {
-      if (!fetchedRegions.has(r)) missingRegions.add(r);
+      if (fetchedRegions.has(r)) continue;
+      // Respect the same region filter as Phase 3: allow-list wins if set,
+      // otherwise honor the exclude-list.
+      if (config.allowedRegions.length > 0) {
+        if (!config.allowedRegions.includes(r)) continue;
+      } else if (config.excludedRegions.includes(r)) {
+        continue;
+      }
+      missingRegions.add(r);
     }
   }
   const extraRegionResults2 = missingRegions.size > 0
